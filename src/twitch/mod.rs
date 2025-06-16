@@ -1,14 +1,13 @@
-use log::info;
 use reqwest::Client;
+pub mod chat_message;
+use crate::twitch::chat_message::ChatMessage;
 use serde::Deserialize;
 use std::env;
 use std::env::VarError;
 use std::error::Error;
 use std::fmt::Debug;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use twitch_irc::login::StaticLoginCredentials;
-use twitch_irc::message::ServerMessage;
 use twitch_irc::message::ServerMessage::Privmsg;
 use twitch_irc::{ClientConfig, SecureTCPTransport, TwitchIRCClient};
 
@@ -63,11 +62,6 @@ pub struct OAuthTokenResponse {
     expires_in: u32,
     scope: Vec<String>,
     token_type: String,
-}
-
-pub struct ChatMessage {
-    message: String,
-    username: String,
 }
 
 impl TwitchApi {
@@ -135,59 +129,7 @@ impl TwitchApi {
         }
     }
 
-    pub async fn connect_to_irc(&self) -> Result<(), Box<dyn Error>> {
-        let stream = TcpStream::connect("irc.chat.twitch.tv:6667").await?;
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader).lines();
-
-        let oauth_token = self.access_token.as_ref().unwrap();
-        let username = "";
-        let channel = "your_channel"; // without the #
-
-        writer
-            .write_all(format!("PASS {}\r\n", oauth_token).as_bytes())
-            .await?;
-        writer
-            .write_all(format!("NICK {}\r\n", username).as_bytes())
-            .await?;
-        writer
-            .write_all(format!("JOIN #{}\r\n", channel).as_bytes())
-            .await?;
-
-        println!("Joined #{} chat", channel);
-
-        while let Some(line) = reader.next_line().await? {
-            println!("> {}", line);
-        }
-        Ok(())
-    }
-
-    pub async fn exchange_code_for_token(&self) -> Result<String, reqwest::Error> {
-        let client = Client::new();
-        let code = env::var("TWITCH_CODE").expect("twitch code is not presented");
-        let redirect_uri =
-            env::var("TWITCH_REDIRECT_URI").expect("TWITCH_REDIRECT_URI is not presented");
-        let params = [
-            ("client_id", &self.client),
-            ("client_secret", &self.secret),
-            ("code", &code),
-            ("grant_type", &"authorization_code".to_string()),
-            ("redirect_uri", &redirect_uri),
-        ];
-
-        let res = client
-            .post("https://id.twitch.tv/oauth2/token")
-            .form(&params)
-            .send()
-            .await?
-            .text()
-            .await?;
-
-        Ok(res)
-    }
-
-    pub async fn listen_to_chat() {
-        tracing_subscriber::fmt::init();
+    pub async fn listen_to_chat() -> Result<(), Box<dyn Error>> {
         // default configuration is to join chat as anonymous.
         let config = ClientConfig::default();
         let (mut incoming_messages, client) =
@@ -195,23 +137,36 @@ impl TwitchApi {
 
         // first thing you should do: start consuming incoming messages,
         // otherwise they will back up.
-        let join_handle = tokio::spawn(async move {
-            while let Some(message) = incoming_messages.recv().await {
-                if let Privmsg(priv_msg) = message {
-                    tracing::info!("Received message: {:?}", priv_msg.message_text);
-                    tracing::info!("Received message: {:?}", priv_msg.sender.login);
+        let join_handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync>>> =
+            tokio::spawn(async move {
+                while let Some(message) = incoming_messages.recv().await {
+                    if let Privmsg(priv_msg) = message {
+                        let msg_id_tag = priv_msg.source.tags.0.get("msg-id");
+                        match msg_id_tag {
+                            Some(_) => {
+                                let chat_message = ChatMessage::new(
+                                    priv_msg.message_text,
+                                    priv_msg.sender.id.parse()?,
+                                );
+                                chat_message.verify_and_send().await.unwrap();
+                            }
+                            None => (),
+                        }
+                    }
                 }
-            }
-        });
+                Ok(())
+            });
 
         // join a channel
         // This function only returns an error if the passed channel login name is malformed,
         // so in this simple case where the channel name is hardcoded we can ignore the potential
         // error with `unwrap`.
-        client.join("rostislav_999".to_owned()).unwrap();
+        let streamer_channel = env::var("STREAMER").expect("STREAMER env is not set");
+        client.join(streamer_channel.to_owned()).unwrap();
 
         // keep the tokio executor alive.
         // If you return instead of waiting the background task will exit.
-        join_handle.await.unwrap();
+        join_handle.await?.expect("Error in join handle");
+        Ok(())
     }
 }
